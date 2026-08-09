@@ -223,18 +223,16 @@ function SaleDetail() {
   async function handleDelete() {
     const items = data?.items ?? [];
     for (const it of items) {
-      await supabase.rpc("adjust_stock", {
-        _product_id: it.product_id,
-        _change_meters: Number(it.meters),
-        _kind: "return",
+      const { error } = await supabase.rpc("return_sale_item", {
+        _sale_item_id: it.id,
+        _meters: Number(it.meters),
         _note: `Отмена продажи ${id.slice(0, 8)}`,
-      });
+      } as never);
+      if (error) return toast.error(error.message);
     }
     const { error } = await supabase.from("sales").delete().eq("id", id);
     if (error) return toast.error(error.message);
-    qc.invalidateQueries({ queryKey: ["sales"] });
-    qc.invalidateQueries({ queryKey: ["cable_products"] });
-    qc.invalidateQueries({ queryKey: ["dashboard-stats"] });
+    refreshAll();
     toast.success(t("Продажа отменена, остатки возвращены"));
     navigate({ to: "/sales" });
   }
