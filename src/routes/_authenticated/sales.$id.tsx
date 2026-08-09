@@ -91,6 +91,43 @@ function SaleDetail() {
     }
   }
 
+  async function restoreCoilIfNeeded(item: any, metersReturned: number) {
+    if (!item || !item.coil_number_snapshot || metersReturned <= 0) return;
+
+    if (item.coil_id) {
+      const { data: coilById } = await supabase
+        .from("cable_coils")
+        .select("id")
+        .eq("id", item.coil_id)
+        .maybeSingle();
+
+      if (coilById) {
+        return;
+      }
+    }
+
+    const { data: coilByNumber } = await supabase
+      .from("cable_coils")
+      .select("id, meters")
+      .eq("product_id", item.product_id)
+      .eq("coil_number", item.coil_number_snapshot)
+      .maybeSingle();
+
+    if (coilByNumber) {
+      const updatedMeters = Number(coilByNumber.meters || 0) + metersReturned;
+      await (supabase as any)
+        .from("cable_coils")
+        .update({ meters: updatedMeters, updated_at: new Date().toISOString() })
+        .eq("id", coilByNumber.id);
+    } else {
+      await (supabase as any).from("cable_coils").insert({
+        product_id: item.product_id,
+        coil_number: item.coil_number_snapshot,
+        meters: metersReturned,
+      });
+    }
+  }
+
   async function handleReturn() {
     if (!returnItem) return;
     const m = Number(returnMeters);
@@ -102,9 +139,15 @@ function SaleDetail() {
       _meters: m,
       _note: null,
     } as never);
-    if (!error) await syncDebtAfterTotalChange();
+    if (error) {
+      setUpdating(false);
+      return toast.error(error.message);
+    }
+
+    await restoreCoilIfNeeded(returnItem, m);
+
+    await syncDebtAfterTotalChange();
     setUpdating(false);
-    if (error) return toast.error(error.message);
     refreshAll();
     setReturnItem(null);
     setReturnMeters("");
@@ -223,12 +266,15 @@ function SaleDetail() {
   async function handleDelete() {
     const items = data?.items ?? [];
     for (const it of items) {
+      const meters = Number(it.meters);
       const { error } = await supabase.rpc("return_sale_item", {
         _sale_item_id: it.id,
-        _meters: Number(it.meters),
+        _meters: meters,
         _note: `Отмена продажи ${id.slice(0, 8)}`,
       } as never);
       if (error) return toast.error(error.message);
+
+      await restoreCoilIfNeeded(it, meters);
     }
     const { error } = await supabase.from("sales").delete().eq("id", id);
     if (error) return toast.error(error.message);
