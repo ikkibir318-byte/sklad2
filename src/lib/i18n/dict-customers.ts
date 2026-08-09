@@ -1,0 +1,18 @@
+export const dictCustomers: Record<string, string> = {
+  "Справочник покупателей": "Xaridorlar ma'lumotnomasi",
+  "Добавить": "Qo'shish",
+  "Новый клиент": "Yangi mijoz",
+  "Имя / компания *": "Ism / kompaniya *",
+  "Имя / компания": "Ism / kompaniya",
+  "Поиск…": "Qidiruv…",
+  "Клиент добавлен": "Mijoz qo'shildi",
+  "Сохранено": "Saqlandi",
+  "Удалено": "O'chirildi",
+  "Удалить клиента?": "Mijozni o'chirasizmi?",
+  "Продажи сохранятся, но потеряют привязку.": "Sotuvlar saqlanadi, lekin mijozga bog'lanishi yo'qoladi.",
+  "Продаж:": "Sotuvlar:",
+  "на": "summasi",
+  "Данные": "Ma'lumotlar",
+  "Редактировать": "Tahrirlash",
+  "История покупок": "Xaridlar tarixi",
+};
