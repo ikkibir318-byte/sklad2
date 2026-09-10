@@ -4,7 +4,7 @@ import { useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { formatMoney, formatMeters } from "@/lib/format";
+import { formatMoney, formatQuantity } from "@/lib/format";
 import { useT } from "@/lib/i18n";
 import {
   Bar,
@@ -34,7 +34,7 @@ function Reports() {
 
       const [sales, items] = await Promise.all([
         supabase.from("sales").select("id, total, cost_total, customer_name_snapshot, sold_at").gte("sold_at", iso),
-        supabase.from("sale_items").select("product_name_snapshot, meters, line_total, sale_id, created_at").gte("created_at", iso),
+        supabase.from("sale_items").select("product_name_snapshot, meters, quantity, unit_type, line_total, sale_id, created_at").gte("created_at", iso),
       ]);
 
       const totalRevenue = (sales.data ?? []).reduce((s, x) => s + Number(x.total), 0);
@@ -52,12 +52,13 @@ function Reports() {
         .slice(0, 10);
 
       // Top products
-      const byProduct = new Map<string, { meters: number; total: number }>();
+      const byProduct = new Map<string, { quantity: number; unit_type: string; total: number }>();
       for (const i of items.data ?? []) {
         const k = i.product_name_snapshot;
-        const cur = byProduct.get(k) ?? { meters: 0, total: 0 };
-        cur.meters += Number(i.meters);
-        cur.total += Number(i.line_total);
+        const cur = byProduct.get(k) ?? { quantity: 0, unit_type: (i as any).unit_type ?? "meter", total: 0 };
+        cur.quantity += Number((i as any).quantity ?? i.meters ?? 0);
+        cur.total += Number(i.line_total ?? 0);
+        cur.unit_type = (i as any).unit_type ?? cur.unit_type ?? "meter";
         byProduct.set(k, cur);
       }
       const topProducts = Array.from(byProduct.entries())
@@ -122,14 +123,14 @@ function Reports() {
       </Card>
 
       <Card>
-        <CardHeader><CardTitle>{t("Топ марок кабеля")}</CardTitle></CardHeader>
+        <CardHeader><CardTitle>{t("Топ позиций")}</CardTitle></CardHeader>
         <CardContent>
           <div className="space-y-2">
             {(data?.topProducts ?? []).length === 0 && <p className="text-sm text-muted-foreground">{t("Нет данных за период")}</p>}
             {(data?.topProducts ?? []).map((p) => (
               <div key={p.name} className="flex items-center justify-between rounded-md border px-3 py-2 text-sm">
                 <span className="font-medium">{p.name}</span>
-                <span className="text-muted-foreground">{formatMeters(p.meters)} · {formatMoney(p.total)}</span>
+                <span className="text-muted-foreground">{formatQuantity(p.quantity, p.unit_type)} · {formatMoney(p.total)}</span>
               </div>
             ))}
           </div>

@@ -7,7 +7,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { formatMoney, formatMeters, formatDateTime, formatDate } from "@/lib/format";
+import { formatMoney, formatMeters, formatQuantity, formatDateTime, formatDate } from "@/lib/format";
+import { unitInputLabel, unitShort, unitStep, getProductUnit } from "@/lib/units";
 import { ArrowLeft, Trash2, Printer, CheckCircle2, AlertTriangle, Clock, Banknote, History, Undo2, Pencil, Plus, Percent } from "lucide-react";
 import { toast } from "sonner";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -67,6 +68,8 @@ function SaleDetail() {
     },
   });
 
+  const productMap = new Map((products ?? []).map((p) => [p.id, p]));
+
   function refreshAll() {
     qc.invalidateQueries({ queryKey: ["sales"] });
     qc.invalidateQueries({ queryKey: ["sales", id] });
@@ -95,18 +98,23 @@ function SaleDetail() {
     if (!item || !item.coil_number_snapshot || metersReturned <= 0) return;
 
     if (item.coil_id) {
-      const { data: coilById } = await supabase
+      const { data: coilById } = await (supabase as any)
         .from("cable_coils")
-        .select("id")
+        .select("id, meters")
         .eq("id", item.coil_id)
         .maybeSingle();
 
       if (coilById) {
+        const updated = Number(coilById.meters || 0) + metersReturned;
+        await (supabase as any)
+          .from("cable_coils")
+          .update({ meters: updated, updated_at: new Date().toISOString() })
+          .eq("id", coilById.id);
         return;
       }
     }
 
-    const { data: coilByNumber } = await supabase
+    const { data: coilByNumber } = await (supabase as any)
       .from("cable_coils")
       .select("id, meters")
       .eq("product_id", item.product_id)
@@ -128,83 +136,290 @@ function SaleDetail() {
     }
   }
 
+  async function recomputeTotalsLocally() {
+    const { data: currentItems } = await (supabase as any).from("sale_items").select("*").eq("sale_id", id);
+    const total = (currentItems ?? []).reduce((s: number, i: any) => s + Number(i.line_total || 0), 0);
+    const costTotal = (currentItems ?? []).reduce(
+      (s: number, i: any) => s + Number((i.quantity ?? i.meters) || 0) * Number(i.unit_cost || 0),
+      0,
+    );
+    const { data: sData } = await supabase.from("sales").select("discount").eq("id", id).single();
+    const discount = Number((sData as any)?.discount || 0);
+    await supabase
+      .from("sales")
+      .update({ total: Math.max(0, total - discount), cost_total: costTotal })
+      .eq("id", id);
+  }
+
   async function handleReturn() {
     if (!returnItem) return;
     const m = Number(returnMeters);
-    if (!m || m <= 0) return toast.error(t("Введите количество метров"));
-    if (m > Number(returnItem.meters)) return toast.error(t("Больше, чем продано"));
+    const itemQty = Number((returnItem as any).quantity ?? returnItem.meters);
+    if (!m || m <= 0) return toast.error(t("Введите количество"));
+    if (m > itemQty) return toast.error(t("Больше, чем продано"));
+
     setUpdating(true);
-    const { error } = await supabase.rpc("return_sale_item", {
-      _sale_item_id: returnItem.id,
-      _meters: m,
-      _note: null,
-    } as never);
-    if (error) {
+    try {
+      const { error: rpcErr } = await (supabase as any).rpc("return_sale_item", {
+        _sale_item_id: returnItem.id,
+        _meters: m,
+        _note: null,
+      });
+
+      if (rpcErr) {
+        // Fallback to direct updates
+        const { data: prod } = await (supabase as any).from("cable_products").select("*").eq("id", returnItem.product_id).single();
+        if (prod) {
+          const newQty = Number((prod as any).stock_quantity ?? prod.stock_meters ?? 0) + m;
+          let prodUpd = await (supabase as any).from("cable_products").update({
+            stock_quantity: newQty,
+            stock_meters: newQty,
+            updated_at: new Date().toISOString(),
+          }).eq("id", prod.id);
+
+          if (prodUpd.error && (prodUpd.error.message?.includes("schema cache") || prodUpd.error.code === "PGRST204")) {
+            await (supabase as any).from("cable_products").update({
+              stock_meters: newQty,
+              updated_at: new Date().toISOString(),
+            }).eq("id", prod.id);
+          }
+        }
+
+        const prodObj = productMap.get(returnItem.product_id);
+        const itemUnit = (returnItem as any).unit_type ?? (prodObj ? getProductUnit(prodObj) : "meter");
+        const isMeter = itemUnit === "meter";
+        if (isMeter) {
+          await restoreCoilIfNeeded(returnItem, m);
+        }
+
+        const { data: userData } = await supabase.auth.getUser();
+        let movRes = await (supabase as any).from("stock_movements").insert({
+          product_id: returnItem.product_id,
+          sale_id: id,
+          kind: "return",
+          change_meters: m,
+          change_quantity: m,
+          note: t("Возврат"),
+          created_by: userData.user?.id ?? null,
+        });
+
+        if (movRes.error && (movRes.error.message?.includes("schema cache") || movRes.error.code === "PGRST204")) {
+          await (supabase as any).from("stock_movements").insert({
+            product_id: returnItem.product_id,
+            sale_id: id,
+            kind: "return",
+            change_meters: m,
+            note: t("Возврат"),
+            created_by: userData.user?.id ?? null,
+          });
+        }
+
+        if (m >= itemQty) {
+          await (supabase as any).from("sale_items").delete().eq("id", returnItem.id);
+        } else {
+          const nextQty = itemQty - m;
+          let siUpd = await (supabase as any).from("sale_items").update({
+            quantity: nextQty,
+            meters: nextQty,
+            line_total: nextQty * Number(returnItem.unit_price),
+          }).eq("id", returnItem.id);
+
+          if (siUpd.error && (siUpd.error.message?.includes("schema cache") || siUpd.error.code === "PGRST204")) {
+            await (supabase as any).from("sale_items").update({
+              meters: nextQty,
+              line_total: nextQty * Number(returnItem.unit_price),
+            }).eq("id", returnItem.id);
+          }
+        }
+
+        await recomputeTotalsLocally();
+      }
+
+      await syncDebtAfterTotalChange();
+      refreshAll();
+      setReturnItem(null);
+      setReturnMeters("");
+      toast.success(t("Возврат оформлен, товар вернулся на склад"));
+    } catch (err: any) {
+      toast.error(err.message || t("Ошибка возврата"));
+    } finally {
       setUpdating(false);
-      return toast.error(error.message);
     }
-
-    await restoreCoilIfNeeded(returnItem, m);
-
-    await syncDebtAfterTotalChange();
-    setUpdating(false);
-    refreshAll();
-    setReturnItem(null);
-    setReturnMeters("");
-    toast.success(t("Возврат оформлен, кабель вернулся на склад"));
   }
 
   async function handleSavePrice() {
     if (!priceItem) return;
     const p = Number(newPrice);
     if (isNaN(p) || p < 0) return toast.error(t("Некорректная цена"));
+
     setUpdating(true);
-    const { error } = await supabase.rpc("set_sale_item_price", {
-      _sale_item_id: priceItem.id,
-      _unit_price: p,
-    } as never);
-    if (!error) await syncDebtAfterTotalChange();
-    setUpdating(false);
-    if (error) return toast.error(error.message);
-    refreshAll();
-    setPriceItem(null);
-    toast.success(t("Цена изменена"));
+    try {
+      const { error: rpcErr } = await (supabase as any).rpc("set_sale_item_price", {
+        _sale_item_id: priceItem.id,
+        _unit_price: p,
+      });
+
+      if (rpcErr) {
+        const qty = Number((priceItem as any).quantity ?? priceItem.meters);
+        await (supabase as any).from("sale_items").update({
+          unit_price: p,
+          line_total: qty * p,
+        }).eq("id", priceItem.id);
+        await recomputeTotalsLocally();
+      }
+
+      await syncDebtAfterTotalChange();
+      refreshAll();
+      setPriceItem(null);
+      toast.success(t("Цена изменена"));
+    } catch (err: any) {
+      toast.error(err.message || t("Ошибка при изменении цены"));
+    } finally {
+      setUpdating(false);
+    }
   }
 
   async function handleSaveDiscount() {
     const d = Number(discountValue) || 0;
     if (d < 0) return toast.error(t("Некорректная скидка"));
+
     setUpdating(true);
-    const { error } = await supabase.rpc("set_sale_discount", { _sale_id: id, _discount: d } as never);
-    if (!error) await syncDebtAfterTotalChange();
-    setUpdating(false);
-    if (error) return toast.error(error.message);
-    refreshAll();
-    setDiscountOpen(false);
-    toast.success(t("Скидка сохранена"));
+    try {
+      const { error: rpcErr } = await (supabase as any).rpc("set_sale_discount", { _sale_id: id, _discount: d });
+      if (rpcErr) {
+        await (supabase as any).from("sales").update({ discount: d }).eq("id", id);
+        await recomputeTotalsLocally();
+      }
+      await syncDebtAfterTotalChange();
+      refreshAll();
+      setDiscountOpen(false);
+      toast.success(t("Скидка сохранена"));
+    } catch (err: any) {
+      toast.error(err.message || t("Ошибка сохранения скидки"));
+    } finally {
+      setUpdating(false);
+    }
   }
 
   async function handleAddItem() {
     const meters = Number(addLine.meters);
-    if (!addLine.product_id) return toast.error(t("Выберите кабель"));
-    if (!meters || meters <= 0) return toast.error(t("Введите количество метров"));
-    const lineCoils = (allCoils ?? []).filter((c) => c.product_id === addLine.product_id);
-    if (lineCoils.length > 0 && !addLine.coil_id) return toast.error(t("Выберите бухту, с которой уходит кабель"));
+    if (!addLine.product_id) return toast.error(t("Выберите товар"));
+    if (!meters || meters <= 0) return toast.error(t("Введите количество"));
+
+    const product = products?.find((p) => p.id === addLine.product_id);
+    const unit = getProductUnit(product);
+    const isMeter = unit === "meter";
+    const lineCoils = isMeter ? (allCoils ?? []).filter((c) => c.product_id === addLine.product_id) : [];
+
+    if (isMeter && lineCoils.length > 0 && !addLine.coil_id) {
+      return toast.error(t("Выберите бухту, с которой уходит кабель"));
+    }
+
     setUpdating(true);
-    const { error } = await supabase.rpc("add_sale_item", {
-      _sale_id: id,
-      _product_id: addLine.product_id,
-      _coil_id: addLine.coil_id || null,
-      _meters: meters,
-      _unit_price: addLine.unit_price === "" ? null : Number(addLine.unit_price),
-    } as never);
-    if (!error) await syncDebtAfterTotalChange();
-    setUpdating(false);
-    if (error) return toast.error(error.message);
-    refreshAll();
-    setAddOpen(false);
-    setAddLine({ product_id: "", coil_id: "", meters: "", unit_price: "" });
-    toast.success(t("Позиция добавлена в продажу"));
+    try {
+      const { error: rpcErr } = await (supabase as any).rpc("add_sale_item", {
+        _sale_id: id,
+        _product_id: addLine.product_id,
+        _coil_id: addLine.coil_id || null,
+        _meters: meters,
+        _unit_price: addLine.unit_price === "" ? null : Number(addLine.unit_price),
+      });
+
+      if (rpcErr) {
+        // Fallback: direct operations
+        const unitPrice = addLine.unit_price === "" ? Number(product?.sale_price ?? 0) : Number(addLine.unit_price);
+        const purchasePrice = Number(product?.purchase_price ?? 0);
+        const currentQty = Number((product as any)?.stock_quantity ?? product?.stock_meters ?? 0);
+        const newQty = Math.max(0, currentQty - meters);
+        const prodName = `${product?.brand ?? ""}${product?.cross_section && product.cross_section !== "-" ? ` ${product.cross_section}` : ""}`.trim();
+
+        let coilNumberSnapshot: string | null = null;
+        if (isMeter && addLine.coil_id) {
+          const coil = allCoils?.find((c) => c.id === addLine.coil_id);
+          if (coil) {
+            coilNumberSnapshot = coil.coil_number;
+            const newCoilMeters = Math.max(0, Number(coil.meters) - meters);
+            await (supabase as any).from("cable_coils").update({ meters: newCoilMeters, updated_at: new Date().toISOString() }).eq("id", addLine.coil_id);
+          }
+        }
+
+        const { data: userData } = await supabase.auth.getUser();
+
+        let siRes = await (supabase as any).from("sale_items").insert({
+          sale_id: id,
+          product_id: addLine.product_id,
+          product_name_snapshot: prodName,
+          meters: meters,
+          quantity: meters,
+          unit_type: unit,
+          unit_price: unitPrice,
+          unit_cost: purchasePrice,
+          line_total: meters * unitPrice,
+          coil_id: addLine.coil_id || null,
+          coil_number_snapshot: coilNumberSnapshot,
+        });
+
+        if (siRes.error && (siRes.error.message?.includes("schema cache") || siRes.error.code === "PGRST204")) {
+          await (supabase as any).from("sale_items").insert({
+            sale_id: id,
+            product_id: addLine.product_id,
+            product_name_snapshot: prodName,
+            meters: meters,
+            unit_price: unitPrice,
+            unit_cost: purchasePrice,
+            line_total: meters * unitPrice,
+            coil_id: addLine.coil_id || null,
+            coil_number_snapshot: coilNumberSnapshot,
+          });
+        }
+
+        let cpUpd = await (supabase as any).from("cable_products").update({
+          stock_quantity: newQty,
+          stock_meters: newQty,
+          updated_at: new Date().toISOString(),
+        }).eq("id", addLine.product_id);
+
+        if (cpUpd.error && (cpUpd.error.message?.includes("schema cache") || cpUpd.error.code === "PGRST204")) {
+          await (supabase as any).from("cable_products").update({
+            stock_meters: newQty,
+            updated_at: new Date().toISOString(),
+          }).eq("id", addLine.product_id);
+        }
+
+        let smRes = await (supabase as any).from("stock_movements").insert({
+          product_id: addLine.product_id,
+          sale_id: id,
+          kind: "sale",
+          change_meters: -meters,
+          change_quantity: -meters,
+          note: t("Продажа"),
+          created_by: userData.user?.id ?? null,
+        });
+
+        if (smRes.error && (smRes.error.message?.includes("schema cache") || smRes.error.code === "PGRST204")) {
+          await (supabase as any).from("stock_movements").insert({
+            product_id: addLine.product_id,
+            sale_id: id,
+            kind: "sale",
+            change_meters: -meters,
+            note: t("Продажа"),
+            created_by: userData.user?.id ?? null,
+          });
+        }
+
+        await recomputeTotalsLocally();
+      }
+
+      await syncDebtAfterTotalChange();
+      refreshAll();
+      setAddOpen(false);
+      setAddLine({ product_id: "", coil_id: "", meters: "", unit_price: "" });
+      toast.success(t("Позиция добавлена в продажу"));
+    } catch (err: any) {
+      toast.error(err.message || t("Ошибка при добавлении позиции"));
+    } finally {
+      setUpdating(false);
+    }
   }
 
   async function handlePartialPayment() {
@@ -221,14 +436,12 @@ function SaleDetail() {
       return toast.error(t("Сумма больше остатка долга") + ` (${formatMoney(remaining)})`);
     }
 
-    // Add the payment
     debtInfo.paid_amount = (debtInfo.paid_amount || 0) + amount;
     debtInfo.payments = [
       ...(debtInfo.payments || []),
       { amount, date: new Date().toISOString() },
     ];
 
-    // Mark as fully paid if the debt is covered
     if (debtInfo.paid_amount >= Number(data.sale.total)) {
       debtInfo.is_paid = true;
     }
@@ -266,15 +479,37 @@ function SaleDetail() {
   async function handleDelete() {
     const items = data?.items ?? [];
     for (const it of items) {
-      const meters = Number(it.meters);
-      const { error } = await supabase.rpc("return_sale_item", {
+      const meters = Number((it as any).quantity ?? it.meters);
+      const { error } = await (supabase as any).rpc("return_sale_item", {
         _sale_item_id: it.id,
         _meters: meters,
         _note: `Отмена продажи ${id.slice(0, 8)}`,
-      } as never);
-      if (error) return toast.error(error.message);
+      });
 
-      await restoreCoilIfNeeded(it, meters);
+      if (error) {
+        // Fallback
+        const { data: prod } = await (supabase as any).from("cable_products").select("*").eq("id", it.product_id).single();
+        if (prod) {
+          const newQty = Number(prod.stock_quantity ?? prod.stock_meters ?? 0) + meters;
+          let prodUpd = await (supabase as any).from("cable_products").update({
+            stock_quantity: newQty,
+            stock_meters: newQty,
+            updated_at: new Date().toISOString(),
+          }).eq("id", prod.id);
+
+          if (prodUpd.error && (prodUpd.error.message?.includes("schema cache") || prodUpd.error.code === "PGRST204")) {
+            await (supabase as any).from("cable_products").update({
+              stock_meters: newQty,
+              updated_at: new Date().toISOString(),
+            }).eq("id", prod.id);
+          }
+        }
+        const prodObj = productMap.get(it.product_id);
+        const itemUnit = (it as any).unit_type ?? (prodObj ? getProductUnit(prodObj) : "meter");
+        if (itemUnit === "meter") {
+          await restoreCoilIfNeeded(it, meters);
+        }
+      }
     }
     const { error } = await supabase.from("sales").delete().eq("id", id);
     if (error) return toast.error(error.message);
@@ -291,12 +526,16 @@ function SaleDetail() {
   const debtStatus = getDebtStatus(debtInfo, saleTotal);
   const remaining = getRemainingDebt(debtInfo, saleTotal);
   const progress = getDebtProgress(debtInfo, saleTotal);
+  const addProduct = products?.find((product) => product.id === addLine.product_id);
+  const addUnit = getProductUnit(addProduct);
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between print:hidden">
         <Button asChild variant="ghost" size="sm">
-          <Link to="/sales"><ArrowLeft className="mr-2 h-4 w-4" /> {t("К списку")}</Link>
+          <Link to="/sales">
+            <ArrowLeft className="mr-2 h-4 w-4" /> {t("К списку")}
+          </Link>
         </Button>
         <div className="flex gap-2">
           {debtInfo.is_debt && !debtInfo.is_paid && (
@@ -318,12 +557,20 @@ function SaleDetail() {
           </Button>
           <Dialog>
             <DialogTrigger asChild>
-              <Button variant="outline" size="sm"><Trash2 className="mr-2 h-4 w-4" /> {t("Отменить")}</Button>
+              <Button variant="outline" size="sm">
+                <Trash2 className="mr-2 h-4 w-4" /> {t("Отменить")}
+              </Button>
             </DialogTrigger>
             <DialogContent>
-              <DialogHeader><DialogTitle>{t("Отменить продажу?")}</DialogTitle></DialogHeader>
-              <p className="text-sm text-muted-foreground">{t("Проданный кабель вернётся на склад.")}</p>
-              <DialogFooter><Button variant="destructive" onClick={handleDelete}>{t("Отменить продажу")}</Button></DialogFooter>
+              <DialogHeader>
+                <DialogTitle>{t("Отменить продажу?")}</DialogTitle>
+              </DialogHeader>
+              <p className="text-sm text-muted-foreground">{t("Проданный товар вернётся на склад.")}</p>
+              <DialogFooter>
+                <Button variant="destructive" onClick={handleDelete}>
+                  {t("Отменить продажу")}
+                </Button>
+              </DialogFooter>
             </DialogContent>
           </Dialog>
         </div>
@@ -331,15 +578,17 @@ function SaleDetail() {
 
       {/* Debt status card */}
       {debtInfo.is_debt && (
-        <Card className={
-          debtInfo.is_paid
-            ? "border-green-300 bg-green-50 dark:bg-green-950/20"
-            : debtStatus.status === "overdue"
-            ? "border-red-300 bg-red-50 dark:bg-red-950/20"
-            : debtStatus.status === "partial"
-            ? "border-blue-300 bg-blue-50 dark:bg-blue-950/20"
-            : "border-amber-300 bg-amber-50 dark:bg-amber-950/20"
-        }>
+        <Card
+          className={
+            debtInfo.is_paid
+              ? "border-green-300 bg-green-50 dark:bg-green-950/20"
+              : debtStatus.status === "overdue"
+              ? "border-red-300 bg-red-50 dark:bg-red-950/20"
+              : debtStatus.status === "partial"
+              ? "border-blue-300 bg-blue-50 dark:bg-blue-950/20"
+              : "border-amber-300 bg-amber-50 dark:bg-amber-950/20"
+          }
+        >
           <CardContent className="p-4 space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
@@ -361,7 +610,9 @@ function SaleDetail() {
                   <div className="text-sm text-muted-foreground">
                     {t("Клиент")}: <span className="font-medium text-foreground">{sale.customer_name_snapshot ?? t("Без имени")}</span>
                     {debtInfo.due_date && (
-                      <> · {t("Срок возврата")}: <span className="font-medium text-foreground">{formatDate(debtInfo.due_date)}</span></>
+                      <>
+                        {" "}· {t("Срок возврата")}: <span className="font-medium text-foreground">{formatDate(debtInfo.due_date)}</span>
+                      </>
                     )}
                     {" "}({debtStatus.label})
                   </div>
@@ -386,17 +637,19 @@ function SaleDetail() {
             {!debtInfo.is_paid && (
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">{t("Оплачено")}: <span className="font-medium text-foreground">{formatMoney(debtInfo.paid_amount)}</span></span>
-                  <span className="text-muted-foreground">{t("Остаток")}: <span className="font-semibold text-foreground">{formatMoney(remaining)}</span></span>
+                  <span className="text-muted-foreground">
+                    {t("Оплачено")}: <span className="font-medium text-foreground">{formatMoney(debtInfo.paid_amount)}</span>
+                  </span>
+                  <span className="text-muted-foreground">
+                    {t("Остаток")}: <span className="font-semibold text-foreground">{formatMoney(remaining)}</span>
+                  </span>
                 </div>
                 <div className="w-full h-3 bg-muted rounded-full overflow-hidden">
                   <div
                     className="h-full rounded-full transition-all duration-500 ease-out"
                     style={{
                       width: `${progress}%`,
-                      background: progress > 0
-                        ? "linear-gradient(90deg, #22c55e, #3b82f6)"
-                        : "transparent",
+                      background: progress > 0 ? "linear-gradient(90deg, #22c55e, #3b82f6)" : "transparent",
                     }}
                   />
                 </div>
@@ -409,7 +662,8 @@ function SaleDetail() {
             {/* Fully paid summary */}
             {debtInfo.is_paid && debtInfo.payments.length > 0 && (
               <div className="text-sm text-muted-foreground">
-                {t("Оплачено за")} {debtInfo.payments.length} {debtInfo.payments.length === 1 ? t("платёж") : t("платежей")} · {t("Итого")}: {formatMoney(debtInfo.paid_amount)}
+                {t("Оплачено за")} {debtInfo.payments.length}{" "}
+                {debtInfo.payments.length === 1 ? t("платёж") : t("платежей")} · {t("Итого")}: {formatMoney(debtInfo.paid_amount)}
               </div>
             )}
           </CardContent>
@@ -453,7 +707,14 @@ function SaleDetail() {
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle>{t("Позиции")}</CardTitle>
           <div className="flex gap-2 print:hidden">
-            <Button variant="outline" size="sm" onClick={() => { setDiscountValue(String(Number((sale as any).discount ?? 0))); setDiscountOpen(true); }}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setDiscountValue(String(Number((sale as any).discount ?? 0)));
+                setDiscountOpen(true);
+              }}
+            >
               <Percent className="mr-2 h-4 w-4" /> {t("Скидка")}
             </Button>
             <Button size="sm" onClick={() => setAddOpen(true)}>
@@ -465,9 +726,9 @@ function SaleDetail() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>{t("Кабель")}</TableHead>
+                <TableHead>{t("Товар")}</TableHead>
                 <TableHead>{t("Бухта")}</TableHead>
-                <TableHead className="text-right">{t("Метров")}</TableHead>
+                <TableHead className="text-right">{t("Количество")}</TableHead>
                 <TableHead className="text-right">{t("Цена")}</TableHead>
                 <TableHead className="text-right">{t("Сумма")}</TableHead>
                 <TableHead className="text-right print:hidden">{t("Действия")}</TableHead>
@@ -475,39 +736,73 @@ function SaleDetail() {
             </TableHeader>
             <TableBody>
               {items.length === 0 && (
-                <TableRow><TableCell colSpan={6} className="py-6 text-center text-muted-foreground">{t("Все позиции возвращены")}</TableCell></TableRow>
-              )}
-              {items.map((i) => (
-                <TableRow key={i.id}>
-                  <TableCell className="font-medium">{i.product_name_snapshot}</TableCell>
-                  <TableCell className="text-muted-foreground">{(i as any).coil_number_snapshot || "—"}</TableCell>
-                  <TableCell className="text-right">{formatMeters(i.meters)}</TableCell>
-                  <TableCell className="text-right">{formatMoney(i.unit_price)}/м</TableCell>
-                  <TableCell className="text-right font-medium">{formatMoney(i.line_total)}</TableCell>
-                  <TableCell className="text-right print:hidden">
-                    <div className="flex justify-end gap-1">
-                      <Button variant="ghost" size="sm" onClick={() => { setPriceItem(i); setNewPrice(String(Number(i.unit_price))); }}>
-                        <Pencil className="mr-1 h-3.5 w-3.5" /> {t("Цена")}
-                      </Button>
-                      <Button variant="ghost" size="sm" className="text-amber-700 dark:text-amber-400" onClick={() => { setReturnItem(i); setReturnMeters(String(Number(i.meters))); }}>
-                        <Undo2 className="mr-1 h-3.5 w-3.5" /> {t("Вернуть")}
-                      </Button>
-                    </div>
+                <TableRow>
+                  <TableCell colSpan={6} className="py-6 text-center text-muted-foreground">
+                    {t("Все позиции возвращены")}
                   </TableCell>
                 </TableRow>
-              ))}
+              )}
+              {items.map((i) => {
+                const prodObj = productMap.get(i.product_id);
+                const itemUnit = (i as any).unit_type ?? (prodObj ? getProductUnit(prodObj) : "meter");
+                const itemQty = Number((i as any).quantity ?? i.meters);
+                return (
+                  <TableRow key={i.id}>
+                    <TableCell className="font-medium">{i.product_name_snapshot}</TableCell>
+                    <TableCell className="text-muted-foreground">{(i as any).coil_number_snapshot || "—"}</TableCell>
+                    <TableCell className="text-right">{formatQuantity(itemQty, itemUnit)}</TableCell>
+                    <TableCell className="text-right">{formatMoney(i.unit_price)}/{unitShort(itemUnit)}</TableCell>
+                    <TableCell className="text-right font-medium">{formatMoney(i.line_total)}</TableCell>
+                    <TableCell className="text-right print:hidden">
+                      <div className="flex justify-end gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => {
+                            setPriceItem(i);
+                            setNewPrice(String(Number(i.unit_price)));
+                          }}
+                        >
+                          <Pencil className="mr-1 h-3.5 w-3.5" /> {t("Цена")}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-amber-700 dark:text-amber-400"
+                          onClick={() => {
+                            setReturnItem(i);
+                            setReturnMeters(String(itemQty));
+                          }}
+                        >
+                          <Undo2 className="mr-1 h-3.5 w-3.5" /> {t("Вернуть")}
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
           <div className="mt-4 space-y-1 border-t pt-4 text-right">
-            <div className="text-sm text-muted-foreground">{t("Себестоимость")}: {formatMoney(sale.cost_total)}</div>
+            <div className="text-sm text-muted-foreground">
+              {t("Себестоимость")}: {formatMoney(sale.cost_total)}
+            </div>
             {Number((sale as any).discount ?? 0) > 0 && (
-              <div className="text-sm font-medium text-blue-600 dark:text-blue-400">{t("Скидка")}: −{formatMoney((sale as any).discount)}</div>
+              <div className="text-sm font-medium text-blue-600 dark:text-blue-400">
+                {t("Скидка")}: −{formatMoney((sale as any).discount)}
+              </div>
             )}
-            <div className="text-sm text-muted-foreground">{t("Прибыль")}: {formatMoney(profit)}</div>
-            <div className="text-xl font-semibold">{t("Итого")}: {formatMoney(sale.total)}</div>
+            <div className="text-sm text-muted-foreground">
+              {t("Прибыль")}: {formatMoney(profit)}
+            </div>
+            <div className="text-xl font-semibold">
+              {t("Итого")}: {formatMoney(sale.total)}
+            </div>
           </div>
           {debtInfo.notes && (
-            <p className="mt-4 border-t pt-4 text-sm text-muted-foreground">{t("Заметка")}: {debtInfo.notes}</p>
+            <p className="mt-4 border-t pt-4 text-sm text-muted-foreground">
+              {t("Заметка")}: {debtInfo.notes}
+            </p>
           )}
         </CardContent>
       </Card>
@@ -515,31 +810,57 @@ function SaleDetail() {
       {/* Return dialog */}
       <Dialog open={!!returnItem} onOpenChange={(o) => !o && setReturnItem(null)}>
         <DialogContent className="sm:max-w-md">
-          <DialogHeader><DialogTitle className="flex items-center gap-2"><Undo2 className="h-5 w-5 text-amber-600" /> {t("Возврат позиции")}</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><Undo2 className="h-5 w-5 text-amber-600" /> {t("Возврат позиции")}</DialogTitle>
+          </DialogHeader>
           {returnItem && (
             <div className="space-y-4">
               <div className="rounded-lg border bg-muted/30 p-3 text-sm space-y-1">
                 <div className="font-medium">{returnItem.product_name_snapshot}</div>
                 <div className="text-muted-foreground">
-                  {t("Продано")}: {formatMeters(returnItem.meters)}
+                  {t("Продано")}: {formatQuantity((returnItem as any).quantity ?? returnItem.meters, (returnItem as any).unit_type ?? (productMap.get(returnItem.product_id) ? getProductUnit(productMap.get(returnItem.product_id)) : "meter"))}
                   {returnItem.coil_number_snapshot ? ` · ${t("Бухта")}: ${returnItem.coil_number_snapshot}` : ""}
                 </div>
               </div>
               <div>
-                <Label className="text-sm font-medium">{t("Сколько метров возвращает клиент")}</Label>
+                <Label className="text-sm font-medium">{t("Сколько товара возвращает клиент")}</Label>
                 <div className="mt-1 flex gap-2">
-                  <Input type="number" step="0.01" min="0" max={Number(returnItem.meters)} value={returnMeters} onChange={(e) => setReturnMeters(e.target.value)} autoFocus />
-                  <Button type="button" variant="outline" size="sm" className="whitespace-nowrap" onClick={() => setReturnMeters(String(Number(returnItem.meters)))}>
+                  <Input
+                    type="number"
+                    step={unitStep((returnItem as any).unit_type ?? (productMap.get(returnItem.product_id) ? getProductUnit(productMap.get(returnItem.product_id)) : "meter"))}
+                    min="0"
+                    max={Number((returnItem as any).quantity ?? returnItem.meters)}
+                    value={returnMeters}
+                    onChange={(e) => setReturnMeters(e.target.value)}
+                    autoFocus
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="whitespace-nowrap"
+                    onClick={() => setReturnMeters(String(Number((returnItem as any).quantity ?? returnItem.meters)))}
+                  >
                     {t("Всё")}
                   </Button>
                 </div>
-                <p className="mt-1 text-xs text-muted-foreground">{t("Метры вернутся на склад и на ту же бухту.")}</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t("Товар вернётся на склад")}{((returnItem as any).unit_type ?? (productMap.get(returnItem.product_id) ? getProductUnit(productMap.get(returnItem.product_id)) : "meter")) === "meter" ? t(" и на ту же бухту.") : "."}
+                </p>
               </div>
             </div>
           )}
           <DialogFooter className="gap-2 sm:gap-0">
-            <Button variant="outline" onClick={() => setReturnItem(null)}>{t("Отмена")}</Button>
-            <Button className="bg-amber-600 hover:bg-amber-700 text-white" onClick={handleReturn} disabled={updating}>{t("Оформить возврат")}</Button>
+            <Button variant="outline" onClick={() => setReturnItem(null)}>
+              {t("Отмена")}
+            </Button>
+            <Button
+              className="bg-amber-600 hover:bg-amber-700 text-white"
+              onClick={handleReturn}
+              disabled={updating}
+            >
+              {t("Оформить возврат")}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -547,24 +868,48 @@ function SaleDetail() {
       {/* Price dialog */}
       <Dialog open={!!priceItem} onOpenChange={(o) => !o && setPriceItem(null)}>
         <DialogContent className="sm:max-w-md">
-          <DialogHeader><DialogTitle>{t("Изменить цену позиции")}</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>{t("Изменить цену позиции")}</DialogTitle>
+          </DialogHeader>
           {priceItem && (
             <div className="space-y-3">
               <div className="text-sm text-muted-foreground">
-                {priceItem.product_name_snapshot} · {formatMeters(priceItem.meters)}
+                {priceItem.product_name_snapshot} ·{" "}
+                {formatQuantity(
+                  (priceItem as any).quantity ?? priceItem.meters,
+                  (priceItem as any).unit_type ?? (productMap.get(priceItem.product_id) ? getProductUnit(productMap.get(priceItem.product_id)) : "meter"),
+                )}
               </div>
               <div>
-                <Label className="text-sm font-medium">{t("Цена сум/м")}</Label>
-                <Input type="number" step="0.01" min="0" value={newPrice} onChange={(e) => setNewPrice(e.target.value)} autoFocus />
+                <Label className="text-sm font-medium">
+                  {t("Цена")}, сум/{unitShort((priceItem as any).unit_type ?? (productMap.get(priceItem.product_id) ? getProductUnit(productMap.get(priceItem.product_id)) : "meter"))}
+                </Label>
+                <Input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={newPrice}
+                  onChange={(e) => setNewPrice(e.target.value)}
+                  autoFocus
+                />
               </div>
               <div className="text-sm">
-                {t("Новая сумма")}: <span className="font-semibold">{formatMoney(Number(priceItem.meters) * (Number(newPrice) || 0))}</span>
+                {t("Новая сумма")}:{" "}
+                <span className="font-semibold">
+                  {formatMoney(
+                    Number((priceItem as any).quantity ?? priceItem.meters) * (Number(newPrice) || 0),
+                  )}
+                </span>
               </div>
             </div>
           )}
           <DialogFooter className="gap-2 sm:gap-0">
-            <Button variant="outline" onClick={() => setPriceItem(null)}>{t("Отмена")}</Button>
-            <Button onClick={handleSavePrice} disabled={updating}>{t("Сохранить")}</Button>
+            <Button variant="outline" onClick={() => setPriceItem(null)}>
+              {t("Отмена")}
+            </Button>
+            <Button onClick={handleSavePrice} disabled={updating}>
+              {t("Сохранить")}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -572,26 +917,58 @@ function SaleDetail() {
       {/* Discount dialog */}
       <Dialog open={discountOpen} onOpenChange={setDiscountOpen}>
         <DialogContent className="sm:max-w-md">
-          <DialogHeader><DialogTitle className="flex items-center gap-2"><Percent className="h-5 w-5 text-blue-600" /> {t("Скидка на продажу")}</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Percent className="h-5 w-5 text-blue-600" /> {t("Скидка на продажу")}
+            </DialogTitle>
+          </DialogHeader>
           <div className="space-y-3">
-            <p className="text-sm text-muted-foreground">{t("Скидка вычитается из итоговой суммы. Долг клиента пересчитается автоматически.")}</p>
+            <p className="text-sm text-muted-foreground">
+              {t("Скидка вычитается из итоговой суммы. Долг клиента пересчитается автоматически.")}
+            </p>
             <div>
               <Label className="text-sm font-medium">{t("Сумма скидки")}</Label>
-              <Input type="number" step="0.01" min="0" value={discountValue} onChange={(e) => setDiscountValue(e.target.value)} autoFocus />
+              <Input
+                type="number"
+                step="0.01"
+                min="0"
+                value={discountValue}
+                onChange={(e) => setDiscountValue(e.target.value)}
+                autoFocus
+              />
             </div>
             <div className="flex gap-2">
               {[5, 10, 15].map((pct) => (
-                <Button key={pct} type="button" variant="outline" size="sm"
-                  onClick={() => setDiscountValue(String(Math.round((items.reduce((s, i) => s + Number(i.line_total), 0) * pct) / 100)))}>
+                <Button
+                  key={pct}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    setDiscountValue(
+                      String(
+                        Math.round(
+                          ((items ?? []).reduce((s, i) => s + Number(i.line_total), 0) * pct) / 100,
+                        ),
+                      ),
+                    )
+                  }
+                >
                   {pct}%
                 </Button>
               ))}
-              <Button type="button" variant="ghost" size="sm" onClick={() => setDiscountValue("0")}>{t("Без скидки")}</Button>
+              <Button type="button" variant="ghost" size="sm" onClick={() => setDiscountValue("0")}>
+                {t("Без скидки")}
+              </Button>
             </div>
           </div>
           <DialogFooter className="gap-2 sm:gap-0">
-            <Button variant="outline" onClick={() => setDiscountOpen(false)}>{t("Отмена")}</Button>
-            <Button onClick={handleSaveDiscount} disabled={updating}>{t("Сохранить")}</Button>
+            <Button variant="outline" onClick={() => setDiscountOpen(false)}>
+              {t("Отмена")}
+            </Button>
+            <Button onClick={handleSaveDiscount} disabled={updating}>
+              {t("Сохранить")}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -599,10 +976,12 @@ function SaleDetail() {
       {/* Add item dialog */}
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
         <DialogContent className="sm:max-w-lg">
-          <DialogHeader><DialogTitle>{t("Добавить позицию в продажу")}</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>{t("Добавить позицию в продажу")}</DialogTitle>
+          </DialogHeader>
           <div className="space-y-3">
             <div>
-              <Label>{t("Кабель")}</Label>
+              <Label>{t("Товар")}</Label>
               <Select
                 value={addLine.product_id}
                 onValueChange={(v) => {
@@ -610,42 +989,85 @@ function SaleDetail() {
                   setAddLine({ ...addLine, product_id: v, coil_id: "", unit_price: p ? String(p.sale_price) : "" });
                 }}
               >
-                <SelectTrigger><SelectValue placeholder={t("Выберите кабель")} /></SelectTrigger>
+                <SelectTrigger>
+                  <SelectValue placeholder={t("Выберите товар")} />
+                </SelectTrigger>
                 <SelectContent>
-                  {products?.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>{p.brand} {p.cross_section} · {formatMeters(p.stock_meters)}</SelectItem>
-                  ))}
+                  {products?.map((p) => {
+                    const pUnit = getProductUnit(p);
+                    return (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.brand}
+                        {p.cross_section && p.cross_section !== "-" ? ` ${p.cross_section}` : ""} ·{" "}
+                        {formatQuantity(
+                          (p as any).stock_quantity ?? p.stock_meters,
+                          pUnit,
+                        )}
+                      </SelectItem>
+                    );
+                  })}
                 </SelectContent>
               </Select>
             </div>
-            <div>
-              <Label>{t("Бухта")}</Label>
-              <Select value={addLine.coil_id} onValueChange={(v) => setAddLine({ ...addLine, coil_id: v })} disabled={!addLine.product_id}>
-                <SelectTrigger><SelectValue placeholder={t("Выберите бухту")} /></SelectTrigger>
-                <SelectContent>
-                  {(allCoils ?? []).filter((c) => c.product_id === addLine.product_id).map((c) => (
-                    <SelectItem key={c.id} value={c.id}>{c.coil_number} · {formatMeters(c.meters)}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+            {addUnit === "meter" && (
+              <div>
+                <Label>{t("Бухта")}</Label>
+                <Select
+                  value={addLine.coil_id}
+                  onValueChange={(v) => setAddLine({ ...addLine, coil_id: v })}
+                  disabled={!addLine.product_id}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder={t("Выберите бухту")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(allCoils ?? [])
+                      .filter((c) => c.product_id === addLine.product_id)
+                      .map((c) => (
+                        <SelectItem key={c.id} value={c.id}>
+                          {c.coil_number} · {formatQuantity(c.meters, "meter")}
+                        </SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <Label>{t("Метров")}</Label>
-                <Input type="number" step="0.01" min="0" value={addLine.meters} onChange={(e) => setAddLine({ ...addLine, meters: e.target.value })} />
+                <Label>{unitInputLabel(addUnit)}</Label>
+                <Input
+                  type="number"
+                  step={unitStep(addUnit)}
+                  min="0"
+                  value={addLine.meters}
+                  onChange={(e) => setAddLine({ ...addLine, meters: e.target.value })}
+                />
               </div>
               <div>
-                <Label>{t("Цена сум/м")}</Label>
-                <Input type="number" step="0.01" min="0" value={addLine.unit_price} onChange={(e) => setAddLine({ ...addLine, unit_price: e.target.value })} />
+                <Label>{t("Цена")}, сум/{unitShort(addUnit)}</Label>
+                <Input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={addLine.unit_price}
+                  onChange={(e) => setAddLine({ ...addLine, unit_price: e.target.value })}
+                />
               </div>
             </div>
             <div className="text-right text-sm">
-              {t("Сумма")}: <span className="font-semibold">{formatMoney((Number(addLine.meters) || 0) * (Number(addLine.unit_price) || 0))}</span>
+              {t("Сумма")}:{" "}
+              <span className="font-semibold">
+                {formatMoney((Number(addLine.meters) || 0) * (Number(addLine.unit_price) || 0))}
+              </span>
             </div>
           </div>
           <DialogFooter className="gap-2 sm:gap-0">
-            <Button variant="outline" onClick={() => setAddOpen(false)}>{t("Отмена")}</Button>
-            <Button onClick={handleAddItem} disabled={updating}>{t("Добавить")}</Button>
+            <Button variant="outline" onClick={() => setAddOpen(false)}>
+              {t("Отмена")}
+            </Button>
+            <Button onClick={handleAddItem} disabled={updating}>
+              {t("Добавить")}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

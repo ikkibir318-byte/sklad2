@@ -7,9 +7,11 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { formatMoney, formatMeters } from "@/lib/format";
+import { formatMoney, formatQuantity } from "@/lib/format";
+import { unitShort, getProductUnit } from "@/lib/units";
 import { useT } from "@/lib/i18n";
 import { Plus, Search } from "lucide-react";
+import { isAdmin } from "@/routes/auth";
 
 export const Route = createFileRoute("/_authenticated/inventory/")({
   component: InventoryList,
@@ -52,7 +54,7 @@ function InventoryList() {
     return (
       !s ||
       p.brand.toLowerCase().includes(s) ||
-      p.cross_section.toLowerCase().includes(s) ||
+      (p.cross_section ?? "").toLowerCase().includes(s) ||
       (p.supplier ?? "").toLowerCase().includes(s)
     );
   });
@@ -62,13 +64,15 @@ function InventoryList() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h1 className="text-2xl font-semibold">{t("Склад")}</h1>
-          <p className="text-sm text-muted-foreground">{t("Марки кабеля и остатки")}</p>
+          <p className="text-sm text-muted-foreground">{t("Кабели, товары на вес и штучные товары")}</p>
         </div>
-        <Button asChild>
-          <Link to="/inventory/new">
-            <Plus className="mr-2 h-4 w-4" /> {t("Добавить кабель")}
-          </Link>
-        </Button>
+        {isAdmin() && (
+          <Button asChild>
+            <Link to="/inventory/new">
+              <Plus className="mr-2 h-4 w-4" /> {t("Добавить позицию")}
+            </Link>
+          </Button>
+        )}
       </div>
 
       <Card>
@@ -86,12 +90,12 @@ function InventoryList() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>{t("Марка")}</TableHead>
-                  <TableHead>{t("Сечение")}</TableHead>
+                  <TableHead>{t("Наименование")}</TableHead>
+                  <TableHead>{t("Характеристика")}</TableHead>
                   <TableHead>{t("Поставщик")}</TableHead>
                   <TableHead className="text-right">{t("Закуп")}</TableHead>
                   <TableHead className="text-right">{t("Продажа")}</TableHead>
-                  <TableHead>{t("Бухты")}</TableHead>
+                  <TableHead>{t("Единица / бухты")}</TableHead>
                   <TableHead className="text-right">{t("Остаток")}</TableHead>
                 </TableRow>
               </TableHeader>
@@ -107,10 +111,12 @@ function InventoryList() {
                   </TableRow>
                 ) : filtered.length === 0 ? (
                   <TableRow><TableCell colSpan={7} className="text-center text-muted-foreground py-8">
-                    {t("Ничего не найдено.")} <Link to="/inventory/new" className="underline">{t("Добавить кабель")}</Link>
+                    {t("Ничего не найдено.")} {isAdmin() && <Link to="/inventory/new" className="underline ml-1">{t("Добавить позицию")}</Link>}
                   </TableCell></TableRow>
                 ) : filtered.map((p) => {
-                  const low = Number(p.stock_meters) <= Number(p.low_stock_threshold ?? 0);
+                  const unit = getProductUnit(p);
+                  const quantity = Number((p as any).stock_quantity ?? p.stock_meters ?? 0);
+                  const low = quantity <= Number(p.low_stock_threshold ?? 0);
                   return (
                     <TableRow key={p.id} className="cursor-pointer hover:bg-muted/50">
                       <TableCell className="font-medium">
@@ -119,19 +125,25 @@ function InventoryList() {
                         </Link>
                       </TableCell>
                       <TableCell>
-                        <Link to="/inventory/$id" params={{ id: p.id }}>{p.cross_section}</Link>
+                        <Link to="/inventory/$id" params={{ id: p.id }}>
+                          {p.cross_section && p.cross_section !== "-" ? p.cross_section : "—"}
+                        </Link>
                       </TableCell>
                       <TableCell className="text-muted-foreground">{p.supplier ?? "—"}</TableCell>
-                      <TableCell className="text-right">{formatMoney(p.purchase_price)}</TableCell>
-                      <TableCell className="text-right">{formatMoney(p.sale_price)}</TableCell>
+                      <TableCell className="text-right">{formatMoney(p.purchase_price)}/{unitShort(unit)}</TableCell>
+                      <TableCell className="text-right">{formatMoney(p.sale_price)}/{unitShort(unit)}</TableCell>
                       <TableCell>
-                        {(coilsByProduct[p.id] ?? []).length === 0 ? (
+                        {unit !== "meter" ? (
+                          <Badge variant="outline" className="font-normal uppercase">
+                            {unitShort(unit)}
+                          </Badge>
+                        ) : (coilsByProduct[p.id] ?? []).length === 0 ? (
                           <span className="text-muted-foreground">{t("Нет бухт")}</span>
                         ) : (
                           <div className="flex flex-wrap gap-1">
                             {(coilsByProduct[p.id] ?? []).map((c) => (
                               <Badge key={c.id} variant="secondary" className="font-normal">
-                                {c.coil_number}: {formatMeters(c.meters)}
+                                {c.coil_number}: {formatQuantity(c.meters, "meter")}
                               </Badge>
                             ))}
                           </div>
@@ -139,9 +151,9 @@ function InventoryList() {
                       </TableCell>
                       <TableCell className="text-right">
                         {low ? (
-                          <Badge variant="destructive">{formatMeters(p.stock_meters)}</Badge>
+                          <Badge variant="destructive">{formatQuantity(quantity, unit)}</Badge>
                         ) : (
-                          <span className="font-medium">{formatMeters(p.stock_meters)}</span>
+                          <span className="font-medium">{formatQuantity(quantity, unit)}</span>
                         )}
                       </TableCell>
                     </TableRow>

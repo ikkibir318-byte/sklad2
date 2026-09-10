@@ -11,7 +11,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { toast } from "sonner";
-import { Cable, Eye, EyeOff, KeyRound } from "lucide-react";
+import { Cable, Eye, EyeOff, Lock } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 import {
   Select,
@@ -20,6 +20,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { verifyPasswordServerFn, type UserRole } from "@/lib/auth-server";
 
 export const Route = createFileRoute("/auth")({
   ssr: false,
@@ -33,49 +34,88 @@ export const Route = createFileRoute("/auth")({
   }),
 });
 
-/** Дефолтный код приглашения */
-const DEFAULT_ACCESS_CODE = "Sm.1234567#";
-const STORAGE_KEY = "kabeluchet_access_code";
-const SESSION_KEY = "kabeluchet_authed";
+const ROLE_STORAGE_KEY = "kabeluchet_user_role";
 
-export function getAccessCode(): string {
-  return localStorage.getItem(STORAGE_KEY) || DEFAULT_ACCESS_CODE;
+export function getAuthRole(): UserRole | null {
+  if (typeof window === "undefined") return null;
+  const role = sessionStorage.getItem(ROLE_STORAGE_KEY) || localStorage.getItem(ROLE_STORAGE_KEY);
+  if (role === "admin" || role === "worker") return role;
+  return null;
 }
 
 export function isAuthenticated(): boolean {
-  return sessionStorage.getItem(SESSION_KEY) === "true";
+  return getAuthRole() !== null;
+}
+
+export function isAdmin(): boolean {
+  return getAuthRole() === "admin";
+}
+
+export function isWorker(): boolean {
+  return getAuthRole() === "worker";
+}
+
+export function setAuthSession(role: UserRole): void {
+  if (typeof window === "undefined") return;
+  sessionStorage.setItem(ROLE_STORAGE_KEY, role);
+  localStorage.setItem(ROLE_STORAGE_KEY, role);
+}
+
+export function clearAuthSession(): void {
+  if (typeof window === "undefined") return;
+  sessionStorage.removeItem(ROLE_STORAGE_KEY);
+  localStorage.removeItem(ROLE_STORAGE_KEY);
 }
 
 function AuthPage() {
   const navigate = useNavigate();
   const { t, lang, setLang } = useI18n();
   const [loading, setLoading] = useState(false);
-  const [code, setCode] = useState("");
-  const [showCode, setShowCode] = useState(false);
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
 
-  // Redirect if already authed
+  // Redirect if already authenticated
   useEffect(() => {
-    if (isAuthenticated()) {
+    const role = getAuthRole();
+    if (role === "admin") {
       navigate({ to: "/", replace: true });
+    } else if (role === "worker") {
+      navigate({ to: "/inventory", replace: true });
     }
   }, [navigate]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!code.trim()) return toast.error(t("Введите код приглашения"));
+    const cleanPassword = password.trim();
+    if (!cleanPassword) {
+      return toast.error(t("Введите пароль"));
+    }
 
     setLoading(true);
-    await new Promise((r) => setTimeout(r, 350)); // slight delay for UX
+    try {
+      // Серверная проверка пароля через TanStack Start Server Function / Supabase RPC
+      const result = await verifyPasswordServerFn({
+        data: { password: cleanPassword },
+      });
 
-    const validCode = getAccessCode();
-    if (code === validCode) {
-      sessionStorage.setItem(SESSION_KEY, "true");
-      toast.success(t("Добро пожаловать!"));
-      navigate({ to: "/", replace: true });
-    } else {
-      toast.error(t("Неверный код приглашения"));
+      if (result.success && result.role) {
+        setAuthSession(result.role);
+        if (result.role === "admin") {
+          toast.success(t("Добро пожаловать, Администратор!"));
+          navigate({ to: "/", replace: true });
+        } else {
+          toast.success(t("Добро пожаловать!"));
+          navigate({ to: "/inventory", replace: true });
+        }
+      } else {
+        toast.error(result.message || t("Неверный пароль"));
+      }
+    } catch (err: any) {
+      console.error("Authentication error:", err);
+      toast.error(t("Ошибка проверки пароля на сервере"));
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }
 
   return (
@@ -105,37 +145,37 @@ function AuthPage() {
         <Card className="shadow-md">
           <CardHeader className="pb-4">
             <CardTitle className="flex items-center gap-2 text-lg">
-              <KeyRound className="h-5 w-5 text-primary" />
-              {t("Вход по коду")}
+              <Lock className="h-5 w-5 text-primary" />
+              {t("Вход в систему")}
             </CardTitle>
             <CardDescription>
-              {t("Введите код приглашения для доступа к системе")}
+              {t("Введите пароль для входа")}
             </CardDescription>
           </CardHeader>
           <CardContent>
             <form onSubmit={handleSubmit} className="space-y-4">
               <div className="space-y-1">
-                <Label htmlFor="access-code">{t("Код приглашения")}</Label>
+                <Label htmlFor="password">{t("Пароль")}</Label>
                 <div className="relative">
                   <Input
-                    id="access-code"
-                    type={showCode ? "text" : "password"}
-                    placeholder={t("Введите код…")}
-                    autoComplete="off"
+                    id="password"
+                    type={showPassword ? "text" : "password"}
+                    placeholder={t("Введите пароль…")}
+                    autoComplete="current-password"
                     autoFocus
                     required
-                    value={code}
-                    onChange={(e) => setCode(e.target.value)}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
                     className="pr-10 font-mono tracking-wider"
                   />
                   <button
                     type="button"
                     className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-                    onClick={() => setShowCode((v) => !v)}
+                    onClick={() => setShowPassword((v) => !v)}
                     tabIndex={-1}
-                    aria-label={showCode ? t("Скрыть код") : t("Показать код")}
+                    aria-label={showPassword ? t("Скрыть пароль") : t("Показать пароль")}
                   >
-                    {showCode ? (
+                    {showPassword ? (
                       <EyeOff className="h-4 w-4" />
                     ) : (
                       <Eye className="h-4 w-4" />
@@ -152,7 +192,7 @@ function AuthPage() {
         </Card>
 
         <p className="mt-6 text-center text-xs text-muted-foreground">
-          {t("Код выдаётся администратором системы")}
+          {t("Пароль выдаётся администратором системы")}
         </p>
       </div>
     </div>

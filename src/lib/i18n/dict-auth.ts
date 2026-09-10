@@ -1,6 +1,12 @@
 export const dictAuth: Record<string, string> = {
   "Учёт склада кабеля, клиентов и продаж": "Kabel ombori, mijozlar va sotuvlar hisobi",
   "Вход по коду": "Kod orqali kirish",
+  "Вход в систему": "Tizimga kirish",
+  "Введите пароль для входа": "Kirish uchun parolni kiriting",
+  "Пароль": "Parol",
+  "Введите пароль…": "Parolni kiriting…",
+  "Скрыть пароль": "Parolni yashirish",
+  "Показать пароль": "Parolni ko'rsatish",
   "Введите код приглашения для доступа к системе":
     "Tizimga kirish uchun taklif kodini kiriting",
   "Код приглашения": "Taklif kodi",
@@ -9,9 +15,14 @@ export const dictAuth: Record<string, string> = {
   "Показать код": "Kodni ko'rsatish",
   "Проверка…": "Tekshirilmoqda…",
   "Войти": "Kirish",
+  "Пароль выдаётся администратором системы": "Parol tizim administratori tomonidan beriladi",
   "Код выдаётся администратором системы": "Kod tizim administratori tomonidan beriladi",
   "Введите код приглашения": "Taklif kodini kiriting",
+  "Введите пароль": "Parolni kiriting",
   "Добро пожаловать!": "Xush kelibsiz!",
+  "Добро пожаловать, Администратор!": "Xush kelibsiz, Administrator!",
+  "Неверный пароль": "Noto'g'ri parol",
   "Неверный код приглашения": "Taklif kodi noto'g'ri",
+  "Ошибка проверки пароля на сервере": "Serverda parolni tekshirishda xatolik",
   "Язык интерфейса": "Interfeys tili",
 };

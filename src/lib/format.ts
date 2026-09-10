@@ -1,4 +1,5 @@
 import { getLang } from "@/lib/i18n";
+import { unitShort } from "@/lib/units";
 
 function locale() {
   return getLang() === "uz" ? "uz-UZ" : "ru-RU";
@@ -14,6 +15,11 @@ export function formatMeters(value: number | string | null | undefined): string 
   const n = Number(value ?? 0);
   const unit = getLang() === "uz" ? "m" : "м";
   return `${new Intl.NumberFormat(locale(), { maximumFractionDigits: 2 }).format(n)} ${unit}`;
+}
+
+export function formatQuantity(value: number | string | null | undefined, unit: string | null | undefined): string {
+  const n = Number(value ?? 0);
+  return `${new Intl.NumberFormat(locale(), { maximumFractionDigits: 2 }).format(n)} ${unitShort(unit)}`;
 }
 
 export function formatDate(value: string | Date): string {

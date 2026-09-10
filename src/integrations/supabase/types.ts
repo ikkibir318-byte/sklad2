@@ -68,7 +68,9 @@ export type Database = {
           purchase_price: number
           sale_price: number
           stock_meters: number
+          stock_quantity: number
           supplier: string | null
+          unit_type: string
           updated_at: string
         }
         Insert: {
@@ -83,7 +85,9 @@ export type Database = {
           purchase_price?: number
           sale_price?: number
           stock_meters?: number
+          stock_quantity?: number
           supplier?: string | null
+          unit_type?: string
           updated_at?: string
         }
         Update: {
@@ -98,7 +102,9 @@ export type Database = {
           purchase_price?: number
           sale_price?: number
           stock_meters?: number
+          stock_quantity?: number
           supplier?: string | null
+          unit_type?: string
           updated_at?: string
         }
         Relationships: []
@@ -162,10 +168,12 @@ export type Database = {
           id: string
           line_total: number
           meters: number
+          quantity: number
           product_id: string
           product_name_snapshot: string
           sale_id: string
           unit_cost: number
+          unit_type: string
           unit_price: number
         }
         Insert: {
@@ -175,10 +183,12 @@ export type Database = {
           id?: string
           line_total: number
           meters: number
+          quantity?: number
           product_id: string
           product_name_snapshot: string
           sale_id: string
           unit_cost?: number
+          unit_type?: string
           unit_price: number
         }
         Update: {
@@ -188,10 +198,12 @@ export type Database = {
           id?: string
           line_total?: number
           meters?: number
+          quantity?: number
           product_id?: string
           product_name_snapshot?: string
           sale_id?: string
           unit_cost?: number
+          unit_type?: string
           unit_price?: number
         }
         Relationships: [
@@ -268,6 +280,7 @@ export type Database = {
       stock_movements: {
         Row: {
           change_meters: number
+          change_quantity: number
           created_at: string
           created_by: string | null
           id: string
@@ -278,6 +291,7 @@ export type Database = {
         }
         Insert: {
           change_meters: number
+          change_quantity?: number
           created_at?: string
           created_by?: string | null
           id?: string
@@ -288,6 +302,7 @@ export type Database = {
         }
         Update: {
           change_meters?: number
+          change_quantity?: number
           created_at?: string
           created_by?: string | null
           id?: string

@@ -1,11 +1,12 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, redirect } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { formatMoney, formatMeters, formatDateTime, formatDate } from "@/lib/format";
+import { formatMoney, formatMeters, formatQuantity, formatDateTime, formatDate } from "@/lib/format";
 import { useT } from "@/lib/i18n";
-import { Package, ShoppingCart, TrendingUp, AlertTriangle, HandCoins, Clock, CheckCircle2 } from "lucide-react";
+import { getProductUnit } from "@/lib/units";
+import { Package, TrendingUp, AlertTriangle, HandCoins, Clock, CheckCircle2 } from "lucide-react";
 import { parseSaleNotes, getDebtStatus, getRemainingDebt } from "@/lib/debt";
 import {
   Line,
@@ -16,8 +17,14 @@ import {
   YAxis,
   CartesianGrid,
 } from "recharts";
+import { isAdmin } from "@/routes/auth";
 
 export const Route = createFileRoute("/_authenticated/")({
+  beforeLoad: async () => {
+    if (typeof window !== "undefined" && !isAdmin()) {
+      throw redirect({ to: "/inventory" });
+    }
+  },
   component: Dashboard,
   head: () => ({
     meta: [
@@ -49,11 +56,11 @@ function Dashboard() {
       const isoSince = since.toISOString();
 
       const [products, sales, lowStock, recentSales, allSales] = await Promise.all([
-        supabase.from("cable_products").select("id, stock_meters, purchase_price, sale_price"),
+        supabase.from("cable_products").select("*"),
         supabase.from("sales").select("total, cost_total, sold_at").gte("sold_at", isoSince),
         supabase
           .from("cable_products")
-          .select("id, brand, cross_section, stock_meters, low_stock_threshold")
+          .select("*")
           .order("stock_meters", { ascending: true })
           .limit(5),
         supabase
@@ -69,13 +76,17 @@ function Dashboard() {
           .limit(250),
       ]);
 
-      const totalStockMeters = (products.data ?? []).reduce((s, p) => s + Number(p.stock_meters), 0);
+      const totalStockMeters = (products.data ?? []).reduce((s, p) => {
+        const isMeter = getProductUnit(p) === "meter";
+        return s + (isMeter ? Number((p as any).stock_quantity ?? p.stock_meters ?? 0) : 0);
+      }, 0);
+
       const stockValuePurchase = (products.data ?? []).reduce(
-        (s, p) => s + Number(p.stock_meters) * Number(p.purchase_price),
+        (s, p) => s + Number((p as any).stock_quantity ?? p.stock_meters ?? 0) * Number(p.purchase_price ?? 0),
         0,
       );
       const stockValueSale = (products.data ?? []).reduce(
-        (s, p) => s + Number(p.stock_meters) * Number(p.sale_price),
+        (s, p) => s + Number((p as any).stock_quantity ?? p.stock_meters ?? 0) * Number(p.sale_price ?? 0),
         0,
       );
       const revenue30 = (sales.data ?? []).reduce((s, x) => s + Number(x.total), 0);
@@ -119,7 +130,7 @@ function Dashboard() {
       }));
 
       const lowStockItems = (lowStock.data ?? []).filter(
-        (p) => Number(p.stock_meters) <= Number(p.low_stock_threshold ?? 0),
+        (p) => Number((p as any).stock_quantity ?? p.stock_meters ?? 0) <= Number(p.low_stock_threshold ?? 0),
       );
 
       return {
@@ -148,7 +159,7 @@ function Dashboard() {
         </div>
         <div className="flex gap-2">
           <Button asChild variant="outline">
-            <Link to="/inventory/new">{t("Добавить кабель")}</Link>
+            <Link to="/inventory/new">{t("Добавить позицию")}</Link>
           </Button>
           <Button asChild>
             <Link to="/sales/new">{t("Новая продажа")}</Link>
@@ -302,14 +313,18 @@ function Dashboard() {
               <p className="text-sm text-muted-foreground">{t("Всё в норме.")}</p>
             ) : (
               <ul className="divide-y">
-                {stats?.lowStockItems.map((p) => (
-                  <li key={p.id} className="flex items-center justify-between py-2 text-sm">
-                    <Link to="/inventory/$id" params={{ id: p.id }} className="hover:underline">
-                      {p.brand} {p.cross_section}
-                    </Link>
-                    <span className="font-medium text-amber-600">{formatMeters(p.stock_meters)}</span>
-                  </li>
-                ))}
+                {stats?.lowStockItems.map((p) => {
+                  const qty = Number((p as any).stock_quantity ?? p.stock_meters ?? 0);
+                  const unit = getProductUnit(p);
+                  return (
+                    <li key={p.id} className="flex items-center justify-between py-2 text-sm">
+                      <Link to="/inventory/$id" params={{ id: p.id }} className="hover:underline">
+                        {p.brand} {p.cross_section && p.cross_section !== "-" ? p.cross_section : ""}
+                      </Link>
+                      <span className="font-medium text-amber-600">{formatQuantity(qty, unit)}</span>
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </CardContent>
