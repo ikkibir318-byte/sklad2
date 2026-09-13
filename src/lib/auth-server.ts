@@ -67,6 +67,7 @@ export const verifyPasswordServerFn = createServerFn({ method: "POST" })
 
 /**
  * Смена пароля администратором на стороне СЕРВЕРА.
+ * Используем service_role клиент для обхода RLS на таблице system_auth.
  */
 export const changePasswordServerFn = createServerFn({ method: "POST" })
   .validator((data: { adminPassword: string; targetRole: UserRole; newPassword: string }) => data)
@@ -78,25 +79,39 @@ export const changePasswordServerFn = createServerFn({ method: "POST" })
     }
 
     try {
-      // Попытка обновления в Supabase через RPC
-      const { data: rpcData, error } = await (supabase as any).rpc("change_system_password", {
+      // Предпочтительно: admin-клиент (service_role) для надёжного обхода RLS
+      let client: any;
+      try {
+        const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+        client = supabaseAdmin;
+      } catch {
+        // service_role key не настроен — используем обычный клиент как fallback
+        console.warn("SUPABASE_SERVICE_ROLE_KEY не настроен, используем обычный клиент для RPC");
+        client = supabase;
+      }
+
+      const { data: rpcData, error } = await client.rpc("change_system_password", {
         admin_password: adminPassword,
         target_role: targetRole,
         new_password: newPassword.trim(),
       });
 
-      if (!error && rpcData) {
+      if (error) {
+        console.error("change_system_password RPC error:", error);
+        return { success: false, message: error.message || "Ошибка при вызове функции смены пароля" };
+      }
+
+      if (rpcData) {
         return {
           success: !!rpcData.success,
           message: rpcData.message || (rpcData.success ? "Пароль успешно обновлён" : "Ошибка обновления пароля"),
         };
       }
-      if (error) {
-        return { success: false, message: error.message };
-      }
+
+      // rpcData пустой — RPC не вернул результат
+      return { success: false, message: "Функция смены пароля не вернула результат. Проверьте, что миграция базы данных выполнена." };
     } catch (e: any) {
+      console.error("changePasswordServerFn error:", e);
       return { success: false, message: e?.message || "Ошибка сервера при смене пароля" };
     }
-
-    return { success: true, message: "Пароль обновлён" };
   });
