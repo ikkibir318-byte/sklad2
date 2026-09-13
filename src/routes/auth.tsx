@@ -29,7 +29,7 @@ export const Route = createFileRoute("/auth")({
     meta: [
       { title: "Вход — КабельУчёт" },
       { name: "description", content: "Вход в систему учёта кабельной продукции." },
-      { name: "robots", content: "noindex" },
+      { name: "robots", content: "index, follow" },
     ],
   }),
 });

@@ -28,6 +28,7 @@ export const Route = createFileRoute("/_authenticated/")({
   component: Dashboard,
   head: () => ({
     meta: [
+      { name: "robots", content: "index, follow" },
       { title: "КабельУчёт — склад, продажи и клиенты" },
       {
         name: "description",
